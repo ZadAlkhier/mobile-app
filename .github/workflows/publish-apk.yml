@@ -1,0 +1,50 @@
+name: Publish APK Update
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  notify-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract APK asset
+        id: apk
+        run: |
+          APK_URL=$(echo '${{ toJson(github.event.release.assets) }}' | jq -r '[.[] | select(.name | endswith(".apk"))][0].browser_download_url')
+          if [ "$APK_URL" = "null" ] || [ -z "$APK_URL" ]; then
+            echo "::error::No APK asset found in release"
+            exit 1
+          fi
+          echo "url=$APK_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Parse is_required flag
+        id: flags
+        run: |
+          IS_REQUIRED=$(echo '${{ github.event.release.body }}' | grep -ioP '(?<=required:\s)(true|false)' | head -1 | tr '[:upper:]' '[:lower:]')
+          echo "is_required=${IS_REQUIRED:-true}" >> "$GITHUB_OUTPUT"
+
+      - name: Send update to API
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          BODY=$(jq -n \
+            --arg version "$TAG" \
+            --argjson is_required "${{ steps.flags.outputs.is_required }}" \
+            --arg download_url "${{ steps.apk.outputs.url }}" \
+            --arg filename "app_${TAG}.apk" \
+            '{version: $version, is_required: $is_required, download_url: $download_url, filename: $filename}')
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
+            "${{ vars.CUSTOMER_PORTAL_API_URL }}/api/apk/settings" \
+            -H "Authorization: Bearer ${{ secrets.APK_ADMIN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::API returned HTTP $HTTP_CODE"
+            echo "$RESPONSE_BODY"
+            exit 1
+          fi
