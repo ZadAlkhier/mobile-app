@@ -80,8 +80,17 @@ jobs:
             --arg filename "app_${TAG}.apk" \
             '{version: $version, is_required: $is_required, download_url: $download_url, filename: $filename}')
 
-          curl -fsS -X PUT \
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
             "${{ steps.api.outputs.url }}/api/apk/settings" \
             -H "Authorization: Bearer ${{ secrets.APK_ADMIN_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "$BODY"
+            -d "$BODY")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::API returned HTTP $HTTP_CODE"
+            echo "$RESPONSE_BODY"
+            exit 1
+          fi
