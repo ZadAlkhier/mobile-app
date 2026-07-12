@@ -3,48 +3,85 @@ name: Publish APK Update
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag"
+        required: true
+        type: string
+      is_required:
+        description: "Is this update required?"
+        required: true
+        type: boolean
+        default: false
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - testing
+          - staging
+          - prod
 
 jobs:
   notify-api:
     runs-on: ubuntu-latest
     steps:
+      - name: Set variables
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "is_required=${{ inputs.is_required }}" >> "$GITHUB_OUTPUT"
+            echo "env=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+          else
+            TAG="${{ github.event.release.tag_name }}"
+            IS_REQUIRED=$(echo '${{ github.event.release.body }}' | grep -ioP '(?<=required:\s)(true|false)' | head -1 | tr '[:upper:]' '[:lower:]')
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "is_required=${IS_REQUIRED:-false}" >> "$GITHUB_OUTPUT"
+            echo "env=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve API URL
+        id: api
+        run: |
+          case "${{ steps.vars.outputs.env }}" in
+            prod)    echo "url=${{ vars.CUSTOMER_PORTAL_API_URL_PROD }}" >> "$GITHUB_OUTPUT" ;;
+            staging) echo "url=${{ vars.CUSTOMER_PORTAL_API_URL_STAGING }}" >> "$GITHUB_OUTPUT" ;;
+            testing) echo "url=${{ vars.CUSTOMER_PORTAL_API_URL_TESTING }}" >> "$GITHUB_OUTPUT" ;;
+            dev)     echo "url=${{ vars.CUSTOMER_PORTAL_API_URL_DEV }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Extract APK asset
         id: apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          APK_URL=$(echo '${{ toJson(github.event.release.assets) }}' | jq -r '[.[] | select(.name | endswith(".apk"))][0].browser_download_url')
+          TAG="${{ steps.vars.outputs.tag }}"
+          RELEASE=$(gh api repos/${{ github.repository }}/releases/tags/"$TAG" 2>&1) || {
+            echo "::error::Release not found for tag '$TAG'"
+            exit 1
+          }
+          APK_URL=$(echo "$RELEASE" | jq -r '[.assets[] | select(.name | endswith(".apk"))][0].browser_download_url')
           if [ "$APK_URL" = "null" ] || [ -z "$APK_URL" ]; then
             echo "::error::No APK asset found in release"
             exit 1
           fi
           echo "url=$APK_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Parse is_required flag
-        id: flags
-        run: |
-          IS_REQUIRED=$(echo '${{ github.event.release.body }}' | grep -ioP '(?<=required:\s)(true|false)' | head -1 | tr '[:upper:]' '[:lower:]')
-          echo "is_required=${IS_REQUIRED:-true}" >> "$GITHUB_OUTPUT"
-
       - name: Send update to API
         run: |
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ steps.vars.outputs.tag }}"
           BODY=$(jq -n \
             --arg version "$TAG" \
-            --argjson is_required "${{ steps.flags.outputs.is_required }}" \
+            --argjson is_required "${{ steps.vars.outputs.is_required }}" \
             --arg download_url "${{ steps.apk.outputs.url }}" \
             --arg filename "app_${TAG}.apk" \
             '{version: $version, is_required: $is_required, download_url: $download_url, filename: $filename}')
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" -X PUT \
-            "${{ vars.CUSTOMER_PORTAL_API_URL }}/api/apk/settings" \
+          curl -fsS -X PUT \
+            "${{ steps.api.outputs.url }}/api/apk/settings" \
             -H "Authorization: Bearer ${{ secrets.APK_ADMIN_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "$BODY")
-
-          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "::error::API returned HTTP $HTTP_CODE"
-            echo "$RESPONSE_BODY"
-            exit 1
-          fi
+            -d "$BODY"
